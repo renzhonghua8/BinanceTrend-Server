@@ -23,6 +23,7 @@ WS_URL = os.getenv("BINANCE_WS_URL", "wss://fstream.binance.com/market/ws/!ticke
 WEBHOOK = os.getenv("DINGTALK_WEBHOOK", "")
 STATE_PATH = Path(os.getenv("STATE_PATH", "/data/state.json"))
 HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8080"))
+ANALYSIS_CACHE_SECONDS = float(os.getenv("ANALYSIS_CACHE_SECONDS", "30"))
 
 
 @dataclass
@@ -36,23 +37,34 @@ class TrendService:
     def __init__(self) -> None:
         self.session: aiohttp.ClientSession | None = None
         self.tickers: dict[str, Ticker] = {}
-        self.leader: str | None = self._load_leader()
+        self.leader_initialized, self.leader = self._load_leader()
         self.last_event_at = 0.0
         self.last_notification_at = 0.0
         self.last_error: str | None = None
         self.notification_lock = asyncio.Lock()
+        self.evaluation_lock = asyncio.Lock()
+        self.evaluation_task: asyncio.Task[None] | None = None
         self.kline_limit = asyncio.Semaphore(10)
+        self.analysis_cache: dict[str, tuple[float, str, float]] = {}
 
-    def _load_leader(self) -> str | None:
+    def _load_leader(self) -> tuple[bool, str | None]:
         try:
-            return json.loads(STATE_PATH.read_text())["leader"]
-        except (FileNotFoundError, KeyError, json.JSONDecodeError):
-            return None
+            state = json.loads(STATE_PATH.read_text())
+            if "qualifiedLeader" not in state:
+                # Ignore the old raw-ranking leader state when upgrading.
+                return False, None
+            return True, state["qualifiedLeader"]
+        except (FileNotFoundError, KeyError, json.JSONDecodeError, TypeError):
+            return False, None
 
-    def _save_leader(self, leader: str) -> None:
+    def _save_leader(self, leader: str | None) -> None:
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         temp = STATE_PATH.with_suffix(".tmp")
-        temp.write_text(json.dumps({"leader": leader}, ensure_ascii=False))
+        temp.write_text(
+            json.dumps(
+                {"version": 2, "qualifiedLeader": leader}, ensure_ascii=False
+            )
+        )
         temp.replace(STATE_PATH)
 
     @staticmethod
@@ -95,17 +107,66 @@ class TrendService:
         ranking = self.top10()
         if not ranking:
             return
-        current = ranking[0].symbol
-        previous = self.leader
-        if previous is None:
+        if self.evaluation_task is None or self.evaluation_task.done():
+            self.evaluation_task = asyncio.create_task(self.evaluate_qualified_leader())
+
+    async def evaluate_qualified_leader(self) -> None:
+        async with self.evaluation_lock:
+            ranking = self.top10()
+            if not ranking:
+                return
+            try:
+                analyses = await asyncio.gather(
+                    *(self.cached_classification(item.symbol) for item in ranking)
+                )
+            except Exception as error:
+                self.last_error = f"analysis: {error}"
+                log.exception("Failed to analyze qualified leaderboard")
+                return
+
+            qualified: list[tuple[int, Ticker, float]] = []
+            for index, (ticker, analysis) in enumerate(zip(ranking, analyses), start=1):
+                mark, line = analysis
+                if mark != "qualified":
+                    continue
+                distance = (ticker.price - line) / ticker.price * 100
+                qualified.append((index, ticker, distance))
+
+            current = qualified[0][1].symbol if qualified else None
+            previous = self.leader
+            if not self.leader_initialized:
+                self.leader_initialized = True
+                self.leader = current
+                self._save_leader(current)
+                log.info(
+                    "Initial qualified leader recorded: %s (no notification)",
+                    current or "none",
+                )
+                return
+            if previous == current:
+                return
+
             self.leader = current
             self._save_leader(current)
-            log.info("Initial leader recorded: %s (no notification)", current)
-        elif previous != current:
-            self.leader = current
-            self._save_leader(current)
-            log.info("Leader changed: %s -> %s", previous, current)
-            asyncio.create_task(self.notify_leader_change(previous, current, ranking.copy()))
+            if current is None:
+                log.info("No qualified leader; previous was %s (no notification)", previous)
+                return
+
+            log.info("Qualified leader changed: %s -> %s", previous or "none", current)
+            await self.notify_leader_change(previous, current, qualified)
+
+    async def cached_classification(self, symbol: str) -> tuple[str, float]:
+        cached = self.analysis_cache.get(symbol)
+        now = time.monotonic()
+        if cached and cached[0] > now:
+            return cached[1], cached[2]
+        mark, line = await self.classify(symbol)
+        self.analysis_cache[symbol] = (
+            now + ANALYSIS_CACHE_SECONDS,
+            mark,
+            line,
+        )
+        return mark, line
 
     async def stream_forever(self) -> None:
         assert self.session
@@ -138,28 +199,25 @@ class TrendService:
                     log.warning("Snapshot refresh failed: %s", snapshot_error)
 
     async def notify_leader_change(
-        self, previous: str, current: str, ranking: list[Ticker]
+        self,
+        previous: str | None,
+        current: str,
+        qualified: list[tuple[int, Ticker, float]],
     ) -> None:
         async with self.notification_lock:
             try:
-                analyses = await asyncio.gather(
-                    *(self.classify(item.symbol, item.price) for item in ranking)
-                )
-                qualified: list[str] = []
-                for index, (ticker, analysis) in enumerate(zip(ranking, analyses), start=1):
-                    mark, distance = analysis
-                    if mark != "qualified":
-                        continue
-                    qualified.append(
+                rows = []
+                for index, ticker, distance in qualified:
+                    rows.append(
                         f"{index}. {ticker.symbol[:-4]}  24H {ticker.percent:+.2f}%  "
                         f"可回撤 {max(0.0, distance):.2f}%  价格 {self.format_price(ticker.price)}"
                     )
-                rows = "\n".join(qualified) if qualified else "暂无方向合格币种"
+                row_text = "\n".join(rows)
                 text = (
                     "Binance 合约榜单提醒\n"
-                    f"第一名变化：{previous[:-4]} → {current[:-4]}\n"
+                    f"合格第一名变化：{previous[:-4] if previous else '暂无'} → {current[:-4]}\n"
                     f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                    f"方向合格榜单：\n{rows}"
+                    f"方向合格榜单：\n{row_text}"
                 )
                 await self.send_dingtalk(text)
                 self.last_notification_at = time.time()
@@ -181,16 +239,15 @@ class TrendService:
         if result.get("errcode") != 0:
             raise RuntimeError(result.get("errmsg", "DingTalk rejected message"))
 
-    async def classify(self, symbol: str, current_price: float) -> tuple[str, float]:
+    async def classify(self, symbol: str) -> tuple[str, float]:
         signals = await asyncio.gather(
             *(self.signal(symbol, interval) for interval in ("5m", "15m", "1h", "4h", "1d"))
         )
         m5 = signals[0]
         high_qualified = all(item[0] for item in signals[1:])
-        distance = (current_price - m5[1]) / current_price * 100
         if not high_qualified:
-            return "normal", distance
-        return ("qualified" if m5[0] else "watch"), distance
+            return "normal", m5[1]
+        return ("qualified" if m5[0] else "watch"), m5[1]
 
     async def signal(self, symbol: str, interval: str) -> tuple[bool, float]:
         assert self.session
@@ -281,6 +338,8 @@ class TrendService:
         healthy = event_age is not None and event_age < 10
         return {
             "ok": healthy,
+            "qualifiedLeader": self.leader,
+            # Kept for compatibility with existing health checks.
             "leader": self.leader,
             "tickerCount": len(self.tickers),
             "lastEventAgeSeconds": event_age,
