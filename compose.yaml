@@ -1,0 +1,17 @@
+services:
+  binance-trend:
+    build: .
+    container_name: binance-trend
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      DINGTALK_WEBHOOK: ${DINGTALK_WEBHOOK}
+      STATE_PATH: /data/state.json
+      HEALTH_PORT: "8080"
+    volumes:
+      - trend-data:/data
+    ports:
+      - "127.0.0.1:18080:8080"
+
+volumes:
+  trend-data:
